@@ -1,6 +1,7 @@
 import { Loc } from '../engine/core/localization.js';
 import { AddDiv, AddDomElement } from '../engine/viewer/domutils.js';
 import { Embed } from './embed.js';
+import { EmbeddedWebsite } from './embeddedwebsite.js';
 import { Website } from './website.js';
 import { SetEventHandler, HandleEvent } from './eventhandler.js';
 import { PluginType, RegisterPlugin } from './pluginregistry.js';
@@ -48,6 +49,16 @@ export function RegisterToolbarPlugin (plugin)
 export function StartWebsite ()
 {
     window.addEventListener ('load', () => {
+        let params = new URLSearchParams (window.location.search);
+        if (params.get ('mode') === 'embedded') {
+            document.body.classList.add ('embedded');
+            let embeddedWebsite = new EmbeddedWebsite ({
+                viewerDiv : document.getElementById ('main_viewer')
+            });
+            embeddedWebsite.Load ();
+            return;
+        }
+
         if (window.self !== window.top) {
             let noEmbeddingDiv = AddDiv (document.body, 'noembed');
             AddDiv (noEmbeddingDiv, null, Loc ('Embedding Online 3D Viewer in an iframe is not supported.'));
@@ -90,3 +101,5 @@ export function StartEmbed ()
         embed.Load ();
     });
 }
+
+export { EmbeddedWebsite };
