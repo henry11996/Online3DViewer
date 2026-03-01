@@ -189,7 +189,7 @@ export class EmbeddedWebsite {
             });
         };
 
-        window.exportCurrentModelToUSDZ = () => {
+        window.exportCurrentModelToUSDZ = (scale) => {
             return new Promise((resolve, reject) => {
                 if (this.threeObject === null) {
                     reject({
@@ -222,8 +222,10 @@ export class EmbeddedWebsite {
                         if (mat.normalMap) { std.normalMap = mat.normalMap; }
                         if (mat.emissive) { std.emissive.copy(mat.emissive); }
                         if (mat.emissiveMap) { std.emissiveMap = mat.emissiveMap; }
-                        if (mat.opacity !== undefined) { std.opacity = mat.opacity; }
-                        if (mat.transparent !== undefined) { std.transparent = mat.transparent; }
+                        // Only preserve transparency if the source material is genuinely translucent
+                        let isTranslucent = mat.alphaMap || (mat.opacity !== undefined && mat.opacity < 1.0);
+                        std.opacity = isTranslucent && mat.opacity !== undefined ? mat.opacity : 1.0;
+                        std.transparent = !!isTranslucent;
                         if (mat.alphaMap) { std.alphaMap = mat.alphaMap; }
                         if (mat.roughness !== undefined) { std.roughness = mat.roughness; } else { std.roughness = 0.7; }
                         if (mat.metalness !== undefined) { std.metalness = mat.metalness; } else { std.metalness = 0.0; }
@@ -233,11 +235,23 @@ export class EmbeddedWebsite {
                     child.material = converted.length === 1 ? converted[0] : converted;
                 });
 
-                // Center the model at origin for USDZ so pivot is at geometric center
+                // Scale FIRST for AR (metersPerUnit = 1 in USDA, so geometry must be in meters)
+                // Caller passes a normalization factor so max dimension ≈ target AR size
+                let originalScale = this.threeObject.scale.clone();
+                let scaleFactor = (typeof scale === 'number' && scale > 0) ? scale : 1;
+                if (scaleFactor !== 1) {
+                    this.threeObject.scale.multiplyScalar(scaleFactor);
+                    this.threeObject.updateMatrixWorld(true);
+                }
+
+                // THEN ground the model: center X/Z at origin, bottom (min Y) at y=0
+                // bbox is now in final scaled coordinates so the offset is correct
                 let bbox = new THREE.Box3().setFromObject(this.threeObject);
                 let center = bbox.getCenter(new THREE.Vector3());
                 let originalPosition = this.threeObject.position.clone();
-                this.threeObject.position.sub(center);
+                this.threeObject.position.x -= center.x;
+                this.threeObject.position.y -= bbox.min.y;
+                this.threeObject.position.z -= center.z;
                 this.threeObject.updateMatrixWorld(true);
 
                 let exporter = new USDZExporter();
@@ -246,10 +260,11 @@ export class EmbeddedWebsite {
                         mesh.material = mat;
                     }
                     this.threeObject.position.copy(originalPosition);
+                    this.threeObject.scale.copy(originalScale);
                     this.threeObject.updateMatrixWorld(true);
                 };
 
-                exporter.parseAsync(this.threeObject).then((arrayBuffer) => {
+                exporter.parseAsync(this.threeObject, { quickLookCompatible: true }).then((arrayBuffer) => {
                     restore();
                     resolve({
                         success: true,
@@ -268,9 +283,50 @@ export class EmbeddedWebsite {
 
         let currentIsDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
 
+        let bgOverride = { color: null, image: null };
+
+        window.setBackgroundColor = (hex) => {
+            bgOverride.color = hex;
+            bgOverride.image = null;
+            this.viewer.scene.background = null;
+            if (hex) {
+                this.viewer.renderer.setClearColor(new THREE.Color(hex), 1.0);
+            } else {
+                this.ApplyTheme(currentIsDark);
+            }
+            this.viewer.Render();
+        };
+
+        window.setBackgroundImage = (dataUrl) => {
+            bgOverride.image = dataUrl;
+            bgOverride.color = null;
+            if (dataUrl) {
+                let loader = new THREE.TextureLoader();
+                loader.load(dataUrl, (texture) => {
+                    this.viewer.scene.background = texture;
+                    this.viewer.Render();
+                });
+            } else {
+                this.viewer.scene.background = null;
+                this.ApplyTheme(currentIsDark);
+                this.viewer.Render();
+            }
+        };
+
         window.setTheme = (isDark) => {
             currentIsDark = isDark;
             this.ApplyTheme(isDark);
+            // Re-apply custom background if set (don't let theme override it)
+            if (bgOverride.color) {
+                this.viewer.renderer.setClearColor(new THREE.Color(bgOverride.color), 1.0);
+                this.viewer.Render();
+            } else if (bgOverride.image) {
+                let loader = new THREE.TextureLoader();
+                loader.load(bgOverride.image, (texture) => {
+                    this.viewer.scene.background = texture;
+                    this.viewer.Render();
+                });
+            }
             updateRulerTheme();
         };
 
@@ -373,6 +429,95 @@ export class EmbeddedWebsite {
                 }
                 this.viewer.Render();
             }
+        };
+
+        // --- Material Overrides ---
+        let materialState = {
+            wireframe: false,
+            colorOverride: null,   // hex string e.g. '#ff0000' or null
+            doubleSided: false,
+            roughness: null,       // number 0-1 or null
+            metalness: null,       // number 0-1 or null
+            originals: new Map()   // mat → { wireframe, color, side, roughness, metalness }
+        };
+
+        let applyMaterialOverrides = () => {
+            // Restore originals first
+            for (let [mat, orig] of materialState.originals) {
+                mat.wireframe = orig.wireframe;
+                mat.color.copy(orig.color);
+                mat.side = orig.side;
+                if (orig.roughness !== undefined) mat.roughness = orig.roughness;
+                if (orig.metalness !== undefined) mat.metalness = orig.metalness;
+                mat.needsUpdate = true;
+            }
+            materialState.originals.clear();
+
+            let anyActive = materialState.wireframe || materialState.colorOverride !== null ||
+                materialState.doubleSided || materialState.roughness !== null || materialState.metalness !== null;
+
+            if (anyActive && this.threeObject) {
+                this.threeObject.traverse((child) => {
+                    if (!child.isMesh || !child.material) return;
+                    let mats = Array.isArray(child.material) ? child.material : [child.material];
+                    for (let mat of mats) {
+                        if (!materialState.originals.has(mat)) {
+                            materialState.originals.set(mat, {
+                                wireframe: mat.wireframe,
+                                color: mat.color.clone(),
+                                side: mat.side,
+                                roughness: mat.roughness,
+                                metalness: mat.metalness
+                            });
+                        }
+                        if (materialState.wireframe) mat.wireframe = true;
+                        if (materialState.colorOverride !== null) mat.color.set(materialState.colorOverride);
+                        if (materialState.doubleSided) mat.side = THREE.DoubleSide;
+                        if (materialState.roughness !== null && mat.roughness !== undefined) mat.roughness = materialState.roughness;
+                        if (materialState.metalness !== null && mat.metalness !== undefined) mat.metalness = materialState.metalness;
+                        mat.needsUpdate = true;
+                    }
+                });
+            }
+            this.viewer.Render();
+        };
+
+        window.setWireframe = (enabled) => {
+            materialState.wireframe = enabled;
+            applyMaterialOverrides();
+        };
+
+        window.setColorOverride = (hex) => {
+            materialState.colorOverride = hex;
+            applyMaterialOverrides();
+        };
+
+        window.setDoubleSided = (enabled) => {
+            materialState.doubleSided = enabled;
+            applyMaterialOverrides();
+        };
+
+        window.setRoughnessOverride = (value) => {
+            materialState.roughness = value;
+            applyMaterialOverrides();
+        };
+
+        window.setMetalnessOverride = (value) => {
+            materialState.metalness = value;
+            applyMaterialOverrides();
+        };
+
+        window.hasPbrMaterials = () => {
+            if (!this.threeObject) return false;
+            let found = false;
+            this.threeObject.traverse((child) => {
+                if (found || !child.isMesh || !child.material) return;
+                let mats = Array.isArray(child.material) ? child.material : [child.material];
+                for (let mat of mats) {
+                    if (mat.roughness !== undefined) { found = true; return; }
+                }
+            });
+            return found;
         };
 
         window.getMeshList = () => {
@@ -981,6 +1126,173 @@ export class EmbeddedWebsite {
                     let text = formatTickNum(converted);
                     updateTickSpriteText(entry.sprite, text, entry.fontSize, entry.baseScale);
                 }
+            }
+            this.viewer.Render();
+        };
+
+        // ───── Point-to-Point Measurement ─────
+        let measureGroup = new THREE.Group();
+        measureGroup.renderOrder = 999;
+        this.viewer.scene.add(measureGroup);
+
+        let measureMode = false;
+        let measurePendingPoint = null;  // { group, point }
+        let measurePairs = [];           // [{ group, rawDistance, elevAngle, direction, labelSprite, angleBetweenSprite, fontSize, baseScale }]
+        let measureUnitLabel = 'mm';
+        let measureUnitFactor = 1;
+
+        function createMeasureDot(position, radius) {
+            let group = new THREE.Group();
+            group.position.copy(position);
+            group.renderOrder = 999;
+            // Outer ring — semi-transparent
+            let ringGeo = new THREE.RingGeometry(radius * 0.5, radius, 32);
+            let ringMat = new THREE.MeshBasicMaterial({ color: 0xff4444, depthTest: false, transparent: true, opacity: 0.35, side: THREE.DoubleSide });
+            let ring = new THREE.Mesh(ringGeo, ringMat);
+            ring.renderOrder = 999;
+            group.add(ring);
+            // Center dot — small, opaque
+            let centerGeo = new THREE.SphereGeometry(radius * 0.18, 12, 12);
+            let centerMat = new THREE.MeshBasicMaterial({ color: 0xff2222, depthTest: false, transparent: true, opacity: 0.95 });
+            let center = new THREE.Mesh(centerGeo, centerMat);
+            center.renderOrder = 1000;
+            group.add(center);
+            return group;
+        }
+
+        function createMeasureLine(a, b) {
+            let geo = new THREE.BufferGeometry().setFromPoints([a, b]);
+            let mat = new THREE.LineBasicMaterial({ color: 0xff4444, depthTest: false, transparent: true, opacity: 0.9 });
+            let line = new THREE.Line(geo, mat);
+            line.renderOrder = 999;
+            return line;
+        }
+
+        window.enableMeasureMode = (enabled, unitLabel, unitFactor) => {
+            measureUnitLabel = unitLabel || 'mm';
+            measureUnitFactor = unitFactor || 1;
+
+            if (enabled) {
+                measureMode = true;
+                let sphere = this.viewer.GetBoundingSphere(() => true);
+                let modelRadius = sphere ? sphere.radius : 1;
+                let dotRadius = modelRadius / 140;
+                let labelFontSize = 20;
+                let labelScale = modelRadius * 0.03;
+
+                this.viewer.SetMouseClickHandler((button, mouseCoords) => {
+                    if (button !== 1) return;
+                    let intersection = this.viewer.GetMeshIntersectionUnderMouse(1, mouseCoords);
+                    if (!intersection) return;
+
+                    if (!measurePendingPoint) {
+                        // First click — place point A
+                        let pairGroup = new THREE.Group();
+                        pairGroup.renderOrder = 999;
+                        let dot = createMeasureDot(intersection.point, dotRadius);
+                        pairGroup.add(dot);
+                        measureGroup.add(pairGroup);
+                        measurePendingPoint = { group: pairGroup, point: intersection.point.clone() };
+                        this.viewer.Render();
+                    } else {
+                        // Second click — place point B, draw line + label
+                        let pairGroup = measurePendingPoint.group;
+                        let pointA = measurePendingPoint.point;
+                        let pointB = intersection.point.clone();
+
+                        let dot = createMeasureDot(pointB, dotRadius);
+                        pairGroup.add(dot);
+
+                        let line = createMeasureLine(pointA, pointB);
+                        pairGroup.add(line);
+
+                        let rawDistance = pointA.distanceTo(pointB);
+                        let displayDistance = rawDistance * measureUnitFactor;
+
+                        // Direction vector & elevation angle from horizontal (XZ plane)
+                        let dir = new THREE.Vector3().subVectors(pointB, pointA);
+                        let dirNorm = dir.clone().normalize();
+                        let horizontalLen = Math.sqrt(dir.x * dir.x + dir.z * dir.z);
+                        let elevAngleDeg = Math.atan2(Math.abs(dir.y), horizontalLen) * (180 / Math.PI);
+
+                        let distStr = displayDistance < 0.01 ? displayDistance.toExponential(2) : displayDistance.toFixed(2);
+                        let text = distStr + ' ' + measureUnitLabel + '  \u2220 ' + elevAngleDeg.toFixed(1) + '\u00B0';
+
+                        let labelResult = createTextSprite(text, labelFontSize);
+                        let labelSprite = labelResult.sprite;
+                        let midpoint = pointA.clone().lerp(pointB, 0.5);
+                        labelSprite.position.copy(midpoint);
+                        // Offset label perpendicular to the line to avoid overlap
+                        let up = new THREE.Vector3(0, 1, 0);
+                        let offset = new THREE.Vector3().crossVectors(dirNorm, up);
+                        if (offset.length() < 0.001) offset.set(1, 0, 0);
+                        offset.normalize().multiplyScalar(dotRadius * 3);
+                        labelSprite.position.add(offset);
+                        labelSprite.scale.set(labelScale * labelResult.aspect, labelScale, 1);
+                        pairGroup.add(labelSprite);
+
+                        let pairEntry = {
+                            group: pairGroup,
+                            rawDistance: rawDistance,
+                            elevAngle: elevAngleDeg,
+                            direction: dirNorm,
+                            labelSprite: labelSprite,
+                            angleBetweenSprite: null,
+                            fontSize: labelFontSize,
+                            baseScale: labelScale
+                        };
+                        measurePairs.push(pairEntry);
+
+                        // Angle between this pair and the previous one (label only)
+                        if (measurePairs.length >= 2) {
+                            let prev = measurePairs[measurePairs.length - 2];
+                            let d = prev.direction.dot(dirNorm);
+                            let angleBetween = Math.acos(Math.max(Math.min(d, 1), -1)) * (180 / Math.PI);
+                            let angleText = '\u2220 ' + angleBetween.toFixed(1) + '\u00B0';
+                            let angleResult = createTextSprite(angleText, labelFontSize);
+                            let angleSprite = angleResult.sprite;
+                            let anglePos = labelSprite.position.clone().lerp(prev.labelSprite.position, 0.5);
+                            anglePos.y += dotRadius * 5;
+                            angleSprite.position.copy(anglePos);
+                            angleSprite.scale.set(labelScale * angleResult.aspect * 0.85, labelScale * 0.85, 1);
+                            pairGroup.add(angleSprite);
+                            pairEntry.angleBetweenSprite = angleSprite;
+                        }
+
+                        measurePendingPoint = null;
+                        this.viewer.Render();
+                    }
+                });
+            } else {
+                measureMode = false;
+                // Remove pending point visual if any
+                if (measurePendingPoint) {
+                    measureGroup.remove(measurePendingPoint.group);
+                    measurePendingPoint = null;
+                }
+                this.viewer.SetMouseClickHandler(null);
+                this.viewer.Render();
+            }
+        };
+
+        window.clearMeasurements = () => {
+            while (measureGroup.children.length > 0) {
+                measureGroup.remove(measureGroup.children[0]);
+            }
+            measurePairs = [];
+            measurePendingPoint = null;
+            this.viewer.Render();
+        };
+
+        window.updateMeasureUnit = (unitLabel, unitFactor) => {
+            measureUnitLabel = unitLabel || 'mm';
+            measureUnitFactor = unitFactor || 1;
+            for (let i = 0; i < measurePairs.length; i++) {
+                let entry = measurePairs[i];
+                let displayDistance = entry.rawDistance * measureUnitFactor;
+                let distStr = displayDistance < 0.01 ? displayDistance.toExponential(2) : displayDistance.toFixed(2);
+                let text = distStr + ' ' + measureUnitLabel + '  \u2220 ' + entry.elevAngle.toFixed(1) + '\u00B0';
+                updateSpriteText(entry.labelSprite, text, entry.fontSize);
             }
             this.viewer.Render();
         };
