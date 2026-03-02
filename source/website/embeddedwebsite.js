@@ -1,4 +1,5 @@
 import { ImportSettings } from '../engine/import/importer.js';
+import { ImporterThreeBase } from '../engine/import/importerthree.js';
 import { AddDomElement } from '../engine/viewer/domutils.js';
 import { Viewer } from '../engine/viewer/viewer.js';
 import { ThreeModelLoaderUI } from './threemodelloaderui.js';
@@ -31,6 +32,22 @@ export class EmbeddedWebsite {
     Load() {
         let canvas = AddDomElement(this.parameters.viewerDiv, 'canvas');
         this.viewer.Init(canvas);
+
+        // Configure worker URL for off-thread THREE.js parsing
+        if (this.parameters.workerUrl) {
+            ImporterThreeBase.workerUrl = this.parameters.workerUrl;
+        } else {
+            // Derive worker URL from current script's base path
+            let scripts = document.getElementsByTagName('script');
+            for (let i = 0; i < scripts.length; i++) {
+                let src = scripts[i].src;
+                if (src && src.indexOf('o3dv.website.min.js') !== -1) {
+                    let basePath = src.substring(0, src.lastIndexOf('/') + 1);
+                    ImporterThreeBase.workerUrl = basePath + 'o3dv.threeparse.worker.js';
+                    break;
+                }
+            }
+        }
 
         this.ApplySystemTheme();
 
@@ -68,7 +85,7 @@ export class EmbeddedWebsite {
         this.viewer.Resize(windowWidth, windowHeight);
     }
 
-    LoadInputFiles(inputFiles, name, url) {
+    LoadInputFiles(inputFiles, name, url, onProgress) {
         return new Promise((resolve, reject) => {
             this.viewer.Clear();
             this.model = null;
@@ -77,6 +94,7 @@ export class EmbeddedWebsite {
             let settings = new ImportSettings();
 
             this.modelLoaderUI.LoadModel(inputFiles, settings, {
+                onProgress: onProgress || null,
                 onStart: () => {
 
                 },
@@ -103,19 +121,19 @@ export class EmbeddedWebsite {
     }
 
     RegisterBridgeFunctions() {
-        window.loadExternalModel = (url, name) => {
+        window.loadExternalModel = (url, name, onProgress) => {
             let inputFiles;
             if (name) {
                 inputFiles = [new InputFile(name, FileSource.Url, url)];
             } else {
                 inputFiles = InputFilesFromUrls([url]);
             }
-            return this.LoadInputFiles(inputFiles, name, url);
+            return this.LoadInputFiles(inputFiles, name, url, onProgress);
         };
 
-        window.loadLocalFile = (file) => {
+        window.loadLocalFile = (file, onProgress) => {
             let inputFiles = InputFilesFromFileObjects([file]);
-            return this.LoadInputFiles(inputFiles, file.name, null);
+            return this.LoadInputFiles(inputFiles, file.name, null, onProgress);
         };
 
         window.exportModel = (format, extension, rotation) => {

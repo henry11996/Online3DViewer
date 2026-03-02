@@ -32,6 +32,9 @@ export class ThreeModelLoaderUI
             onFileListProgress : (current, total) => {
             },
             onFileLoadProgress : (current, total) => {
+                if (callbacks.onProgress && total > 0) {
+                    callbacks.onProgress ({ phase: 'downloading', loaded: current, total: total });
+                }
             },
             onSelectMainFile : (fileNames, selectFile) => {
                 progressDialog.Close ();
@@ -42,9 +45,15 @@ export class ThreeModelLoaderUI
             },
             onImportStart : () => {
                 progressDialog.SetText (Loc ('Importing Model'));
+                if (callbacks.onProgress) {
+                    callbacks.onProgress ({ phase: 'importing', loaded: 0, total: 0 });
+                }
             },
             onVisualizationStart : () => {
                 progressDialog.SetText (Loc ('Visualizing Model'));
+                if (callbacks.onProgress) {
+                    callbacks.onProgress ({ phase: 'visualizing', loaded: 0, total: 0 });
+                }
             },
             onModelFinished : (importResult, threeObject) => {
                 progressDialog.Close ();

@@ -8,6 +8,7 @@ import { PhongMaterial, TextureMap } from '../model/material.js';
 import { Node } from '../model/node.js';
 import { ConvertThreeColorToColor, ConvertThreeGeometryToMesh, ThreeSRGBToLinearColorConverter } from '../threejs/threeutils.js';
 import { ImporterBase } from './importerbase.js';
+import { ReconstructThreeGroup } from '../../website/workers/threeparsereconstruct.js';
 
 import * as THREE from 'three';
 import { TGALoader } from 'three/examples/jsm/loaders/TGALoader.js';
@@ -24,6 +25,16 @@ export class ImporterThreeBase extends ImporterBase
         super ();
 
         this.colorConverter = null;
+    }
+
+    GetFormatType ()
+    {
+        return null;
+    }
+
+    CanUseWorker ()
+    {
+        return ImporterThreeBase.workerUrl !== null && this.GetFormatType () !== null;
     }
 
     CreateLoader (manager)
@@ -61,6 +72,82 @@ export class ImporterThreeBase extends ImporterBase
     }
 
     LoadModel (fileContent, onFinish)
+    {
+        if (this.CanUseWorker ()) {
+            this.LoadModelWithWorker (fileContent, onFinish);
+            return;
+        }
+        this.LoadModelMainThread (fileContent, onFinish);
+    }
+
+    LoadModelWithWorker (fileContent, onFinish)
+    {
+        let formatType = this.GetFormatType ();
+
+        let worker = null;
+        let didFallback = false;
+        let fallbackToMainThread = () => {
+            if (didFallback) { return; }
+            didFallback = true;
+            if (worker) {
+                worker.terminate ();
+                worker = null;
+            }
+            this.LoadModelMainThread (fileContent, onFinish);
+        };
+
+        try {
+            worker = new Worker (ImporterThreeBase.workerUrl);
+        } catch (err) {
+            fallbackToMainThread ();
+            return;
+        }
+
+        worker.onmessage = (event) => {
+            worker.terminate ();
+            worker = null;
+            let result = event.data;
+            if (!result.success) {
+                fallbackToMainThread ();
+                return;
+            }
+            try {
+                let threeGroup = ReconstructThreeGroup (result);
+                if (threeGroup === null) {
+                    fallbackToMainThread ();
+                    return;
+                }
+                this.OnThreeObjectsLoaded (threeGroup, onFinish, true);
+            } catch (err) {
+                fallbackToMainThread ();
+            }
+        };
+
+        worker.onerror = () => {
+            fallbackToMainThread ();
+        };
+
+        // For text-based formats (DAE, WRL), send as ArrayBuffer — worker will decode
+        let transferData;
+        if (fileContent instanceof ArrayBuffer) {
+            transferData = fileContent.slice (0);
+        } else if (ArrayBuffer.isView (fileContent)) {
+            transferData = fileContent.buffer.slice (
+                fileContent.byteOffset,
+                fileContent.byteOffset + fileContent.byteLength
+            );
+        } else {
+            // String content — encode to ArrayBuffer
+            transferData = new TextEncoder ().encode (fileContent).buffer;
+        }
+
+        worker.postMessage ({
+            type: formatType,
+            data: transferData
+        }, [transferData]);
+    }
+
+    LoadModelMainThread (fileContent, onFinish)
     {
         let isAllLoadersDone = false;
         let loadingManager = new THREE.LoadingManager (() => {
@@ -110,7 +197,7 @@ export class ImporterThreeBase extends ImporterBase
         );
     }
 
-    OnThreeObjectsLoaded (loadedObject, onFinish)
+    OnThreeObjectsLoaded (loadedObject, onFinish, isMainObject)
     {
         function GetObjectTransformation (threeObject)
         {
@@ -141,7 +228,7 @@ export class ImporterThreeBase extends ImporterBase
             }
         }
 
-        let mainObject = this.GetMainObject (loadedObject);
+        let mainObject = isMainObject ? loadedObject : this.GetMainObject (loadedObject);
         let rootNode = this.model.GetRootNode ();
         rootNode.SetTransformation (GetObjectTransformation (mainObject));
         for (let childObject of mainObject.children) {
@@ -283,11 +370,18 @@ export class ImporterThreeBase extends ImporterBase
     }
 }
 
+ImporterThreeBase.workerUrl = null;
+
 export class ImporterThreeFbx extends ImporterThreeBase
 {
     constructor ()
     {
         super ();
+    }
+
+    GetFormatType ()
+    {
+        return 'fbx';
     }
 
     CanImportExtension (extension)
@@ -319,6 +413,11 @@ export class ImporterThreeDae extends ImporterThreeBase
         super ();
     }
 
+    GetFormatType ()
+    {
+        return 'dae';
+    }
+
     CanImportExtension (extension)
     {
         return extension === 'dae';
@@ -346,6 +445,11 @@ export class ImporterThreeWrl extends ImporterThreeBase
     constructor ()
     {
         super ();
+    }
+
+    GetFormatType ()
+    {
+        return 'wrl';
     }
 
     CanImportExtension (extension)
@@ -393,6 +497,11 @@ export class ImporterThree3mf extends ImporterThreeBase
         this.colorConverter = new ThreeSRGBToLinearColorConverter ();
     }
 
+    GetFormatType ()
+    {
+        return '3mf';
+    }
+
     CanImportExtension (extension)
     {
         return extension === '3mf';
@@ -419,6 +528,11 @@ export class ImporterThreeAmf extends ImporterThreeBase
     constructor ()
     {
         super ();
+    }
+
+    GetFormatType ()
+    {
+        return 'amf';
     }
 
     CanImportExtension (extension)
